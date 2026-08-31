@@ -1,0 +1,47 @@
+services:
+
+  aave-monitor:
+
+    build: .
+
+    container_name: aave-monitor
+
+    restart: unless-stopped
+
+    # No published ports -- this service only makes outbound RPC and
+    # Telegram calls, it doesn't listen for anything.
+
+    volumes:
+      - ./data:/app/data
+      - ./secret.key:/app/secret.key:ro
+      - ./secrets.enc.json:/app/secrets.enc.json
+      - ./constants.py:/app/constants.py:ro
+
+    # Modest limits so this plays nicely with whatever else ends up on the
+    # Pi (e.g. a local LLM container) -- raise if the monitor gets OOM-killed.
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+# --------------------------------------------------------------------------
+# When you add the local LLM tomorrow, give it its own service here so it's
+# isolated from this one, e.g.:
+#
+#   llm:
+#     image: ollama/ollama
+#     container_name: local-llm
+#     restart: unless-stopped
+#     ports:
+#       - "11434:11434"
+#     volumes:
+#       - ollama-data:/root/.ollama
+#     deploy:
+#       resources:
+#         limits:
+#           memory: 4G
+#
+# volumes:
+#   ollama-data:
+# --------------------------------------------------------------------------

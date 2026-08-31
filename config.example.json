@@ -1,0 +1,51 @@
+{
+  "poll_interval_seconds": 1800,
+  "discovery_interval_seconds": 86400,
+
+  "telegram_bot_token": "${telegram_bot_token}",
+  "telegram_chat_id": "${telegram_chat_id}",
+
+  "chains": [
+    {
+      "name": "Ethereum",
+      "chain_id": 1,
+      "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/${alchemy_api_key}",
+      "pool_address": "0x87870Bca3F3fD6335C3F4CE8392D69350B4fA4E2",
+      "data_provider_address": "0x0a16f2FCC0D44FaE41cc54e079281D84A363bECD"
+    },
+    {
+      "name": "Plasma",
+      "chain_id": 9745,
+      "rpc_url": "https://plasma-mainnet.g.alchemy.com/v2/${alchemy_api_key}",
+      "pool_address": "0x925a2A7214Ed92428B5b1B090F80b25700095e12",
+      "data_provider_address": "0xf2D6E38B407e31E7E7e4a16E6769728b76c7419F"
+    },
+    {
+      "name": "Arbitrum",
+      "chain_id": 42161,
+      "rpc_url": "https://arb-mainnet.g.alchemy.com/v2/${alchemy_api_key}",
+      "pool_address": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+      "data_provider_address": "0x243Aa95cAC2a25651eda86e80bEe66114413c43b"
+    },
+    {
+      "name": "Base",
+      "chain_id": 8453,
+      "rpc_url": "https://base-mainnet.g.alchemy.com/v2/${alchemy_api_key}",
+      "pool_address": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+      "data_provider_address": "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
+    },
+    {
+      "name": "Monad",
+      "chain_id": 143,
+      "rpc_url": "https://monad-mainnet.g.alchemy.com/v2/${alchemy_api_key}",
+      "pool_address": "0x69a5F9AD4f96ebf0a0C792dD42a01cC5C0102fef",
+      "data_provider_address": "0xB65A68B98274ef7D9a60E0C0747dD1BEc3D32fad"
+    }
+  ],
+
+  "assets": [
+    { "symbol": "WETH", "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "decimals": 18, "supply_change_alert_pct": 5.0 },
+    { "symbol": "USDC", "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6, "supply_change_alert_pct": 3.0 },
+    { "symbol": "DAI",  "address": "0x6B175474E89094C44Da98b954EedeAC495271d0F", "decimals": 18, "supply_change_alert_pct": 3.0 }
+  ]
+}
