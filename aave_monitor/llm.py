@@ -17,8 +17,11 @@ import requests
 from .logging_setup import log
 
 
-OLLAMA_URL = (
-    "http://127.0.0.1:11434/api/generate"
+import os
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434/api/generate",
 )
 
 DEFAULT_MODEL = "qwen2.5:1.5b"

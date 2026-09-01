@@ -17,17 +17,55 @@ The largest relevant events are included in the alert.
 
 LiquidationCall handling is direction-aware.
 
-Borrow decoding supports both:
+Borrow decoding supports multiple layouts observed across Aave
+deployments:
 
     1. Standard Aave V3:
-       reserve, user, onBehalfOf, referralCode are indexed
+           reserve, user, onBehalfOf, referralCode are indexed.
 
-    2. Deployments such as the current Monad deployment:
-       reserve, user, onBehalfOf are indexed and referralCode is
-       non-indexed
+           topics:
+               topic0
+               reserve
+               user
+               onBehalfOf
+               referralCode
 
-Both layouts have the same Solidity event signature / topic0 because
-indexed-ness is not part of the event signature hash.
+           data:
+               amount
+               interestRateMode
+               borrowRate
+
+    2. Four-topic Borrow with no referralCode in the emitted data:
+
+           topics:
+               topic0
+               reserve
+               user
+               onBehalfOf
+
+           data:
+               amount
+               interestRateMode
+               borrowRate
+
+    3. Four-topic Borrow with referralCode non-indexed:
+
+           topics:
+               topic0
+               reserve
+               user
+               onBehalfOf
+
+           data:
+               amount
+               interestRateMode
+               borrowRate
+               referralCode
+
+Important:
+
+Indexed vs non-indexed parameters do not affect topic0, so multiple
+layouts can legitimately share the same event signature hash.
 """
 
 from eth_abi import decode as abi_decode
@@ -38,7 +76,6 @@ from .logging_setup import log
 
 
 DEFAULT_MAX_BLOCK_RANGE = 10
-
 MAX_ACTIVITY_EVENTS = 5
 
 
@@ -263,22 +300,19 @@ def get_activity_event_topics():
     Calculate topic0 hashes from the event signatures.
 
     IMPORTANT:
+
     Indexed vs non-indexed parameters do not affect topic0.
     """
 
     signatures = {
-        "Supply": (
-            "Supply(address,address,address,uint256,uint16)"
-        ),
-        "Withdraw": (
-            "Withdraw(address,address,address,uint256)"
-        ),
+        "Supply": "Supply(address,address,address,uint256,uint16)",
+        "Withdraw": "Withdraw(address,address,address,uint256)",
         "Borrow": (
-            "Borrow(address,address,address,uint256,uint8,uint256,uint16)"
+            "Borrow("
+            "address,address,address,uint256,uint8,uint256,uint16"
+            ")"
         ),
-        "Repay": (
-            "Repay(address,address,address,uint256,bool)"
-        ),
+        "Repay": "Repay(address,address,address,uint256,bool)",
         "LiquidationCall": (
             "LiquidationCall("
             "address,address,address,uint256,uint256,address,bool"
@@ -307,17 +341,20 @@ def get_activity_logs(
     """
     Query Aave Pool activity events using eth_getLogs, chunked to
     max_block_range blocks per request.
+
+    A small range is intentional because some RPC providers impose
+    restrictions on eth_getLogs requests.
     """
 
     if from_block > to_block:
         return []
 
-    topic0_list = list(
-        get_activity_event_topics().values()
-    )
+    if max_block_range <= 0:
+        raise ValueError("max_block_range must be greater than zero")
+
+    topic0_list = list(get_activity_event_topics().values())
 
     logs = []
-
     current_from = from_block
 
     while current_from <= to_block:
@@ -332,17 +369,26 @@ def get_activity_logs(
             chunk_to,
         )
 
-        chunk_logs = w3.eth.get_logs(
-            {
-                "address": pool.address,
-                "fromBlock": current_from,
-                "toBlock": chunk_to,
-                "topics": [topic0_list],
-            }
-        )
+        try:
+            chunk_logs = w3.eth.get_logs(
+                {
+                    "address": pool.address,
+                    "fromBlock": current_from,
+                    "toBlock": chunk_to,
+                    "topics": [topic0_list],
+                }
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to fetch Aave activity logs for blocks "
+                "%d-%d: %s",
+                current_from,
+                chunk_to,
+                exc,
+            )
+            raise
 
         logs.extend(chunk_logs)
-
         current_from = chunk_to + 1
 
     return logs
@@ -385,70 +431,324 @@ def _decode_address_topic(topic):
     )
 
 
-# ---------------------------------------------------------------------------
-# Log decoding
-# ---------------------------------------------------------------------------
-
-
-def _decode_monad_borrow_log(raw_log):
+def _normalize_log_data(data):
     """
-    Decode the 4-topic Borrow variant emitted by the current Monad
-    deployment.
-
-    Topic layout:
-
-        topic0       = event signature
-        topic1       = reserve
-        topic2       = user
-        topic3       = onBehalfOf
-
-    Data layout:
-
-        uint256 amount
-        uint8   interestRateMode
-        uint256 borrowRate
-        uint16  referralCode
-
-    The event signature is identical to standard Aave Borrow because
-    indexed-ness does not form part of topic0.
+    Convert Web3 log data into bytes.
     """
 
-    topics = raw_log.get("topics", [])
+    if isinstance(data, bytes):
+        return data
 
-    if len(topics) != 4:
-        raise ValueError(
-            "Monad Borrow decoder expected 4 topics, "
-            f"got {len(topics)}"
-        )
-
-    data = raw_log.get("data", b"")
+    if isinstance(data, bytearray):
+        return bytes(data)
 
     if isinstance(data, str):
-        data = bytes.fromhex(
+        return bytes.fromhex(
             data[2:] if data.startswith("0x") else data
         )
 
-    amount, interest_rate_mode, borrow_rate, referral_code = (
-        abi_decode(
-            [
-                "uint256",
-                "uint8",
-                "uint256",
-                "uint16",
-            ],
-            data,
-        )
+    return bytes(data)
+
+
+# ---------------------------------------------------------------------------
+# Borrow decoding
+# ---------------------------------------------------------------------------
+
+
+def _decode_borrow_log(raw_log):
+    """
+    Decode a Borrow event.
+
+    Supported layouts:
+
+    Standard Aave V3
+    -----------------
+    5 topics:
+
+        topic0
+        reserve
+        user
+        onBehalfOf
+        referralCode
+
+    Data:
+
+        uint256 amount
+        uint8 interestRateMode
+        uint256 borrowRate
+
+    Four-topic variant with no referralCode
+    ----------------------------------------
+
+    4 topics:
+
+        topic0
+        reserve
+        user
+        onBehalfOf
+
+    Data:
+
+        uint256 amount
+        uint8 interestRateMode
+        uint256 borrowRate
+
+    Four-topic variant with non-indexed referralCode
+    ------------------------------------------------
+
+    4 topics:
+
+        topic0
+        reserve
+        user
+        onBehalfOf
+
+    Data:
+
+        uint256 amount
+        uint8 interestRateMode
+        uint256 borrowRate
+        uint16 referralCode
+
+    Returns:
+        dict containing decoded Borrow arguments, or None if invalid.
+    """
+
+    topics = raw_log.get("topics", [])
+    topic_count = len(topics)
+
+    if topic_count not in (4, 5):
+        return None
+
+    data = _normalize_log_data(
+        raw_log.get("data", b"")
     )
 
-    return {
-        "reserve": _decode_address_topic(topics[1]),
-        "user": _decode_address_topic(topics[2]),
-        "onBehalfOf": _decode_address_topic(topics[3]),
-        "amount": int(amount),
-        "interestRateMode": int(interest_rate_mode),
-        "borrowRate": int(borrow_rate),
-        "referralCode": int(referral_code),
-    }
+    data_length = len(data)
+
+    # ------------------------------------------------------------------
+    # Standard five-topic Aave V3 Borrow
+    # ------------------------------------------------------------------
+
+    if topic_count == 5:
+        expected_length = 32 * 3
+
+        if data_length != expected_length:
+            log.warning(
+                "Skipping 5-topic Borrow with unexpected data length: "
+                "expected %d bytes, got %d "
+                "(block=%s, tx=%s)",
+                expected_length,
+                data_length,
+                raw_log.get("blockNumber"),
+                _tx_hash_from_log(raw_log),
+            )
+            return None
+
+        try:
+            (
+                amount,
+                interest_rate_mode,
+                borrow_rate,
+            ) = abi_decode(
+                [
+                    "uint256",
+                    "uint8",
+                    "uint256",
+                ],
+                data,
+            )
+        except Exception as exc:
+            log.warning(
+                "Skipping undecodable 5-topic Borrow: %s "
+                "(block=%s, tx=%s)",
+                exc,
+                raw_log.get("blockNumber"),
+                _tx_hash_from_log(raw_log),
+            )
+            return None
+
+        referral_code = int.from_bytes(
+            _normalize_log_data(topics[4]),
+            "big",
+        )
+
+        # A referralCode is uint16, so the indexed topic must contain
+        # only the value in the low 16 bits.
+        if referral_code > 65535:
+            log.warning(
+                "Skipping 5-topic Borrow with invalid referralCode=%s "
+                "(block=%s, tx=%s)",
+                referral_code,
+                raw_log.get("blockNumber"),
+                _tx_hash_from_log(raw_log),
+            )
+            return None
+
+        # Aave interest-rate modes are currently small values.
+        if int(interest_rate_mode) not in (1, 2, 3):
+            log.warning(
+                "Skipping 5-topic Borrow with unexpected "
+                "interestRateMode=%s "
+                "(block=%s, tx=%s)",
+                interest_rate_mode,
+                raw_log.get("blockNumber"),
+                _tx_hash_from_log(raw_log),
+            )
+            return None
+
+        return {
+            "reserve": _decode_address_topic(topics[1]),
+            "user": _decode_address_topic(topics[2]),
+            "onBehalfOf": _decode_address_topic(topics[3]),
+            "amount": int(amount),
+            "interestRateMode": int(interest_rate_mode),
+            "borrowRate": int(borrow_rate),
+            "referralCode": referral_code,
+        }
+
+    # ------------------------------------------------------------------
+    # Four-topic Borrow variants
+    # ------------------------------------------------------------------
+
+    if topic_count == 4:
+
+        # --------------------------------------------------------------
+        # Variant A:
+        #
+        # amount
+        # interestRateMode
+        # borrowRate
+        #
+        # 3 ABI words = 96 bytes
+        # --------------------------------------------------------------
+
+        if data_length == 32 * 3:
+            try:
+                (
+                    amount,
+                    interest_rate_mode,
+                    borrow_rate,
+                ) = abi_decode(
+                    [
+                        "uint256",
+                        "uint8",
+                        "uint256",
+                    ],
+                    data,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Skipping undecodable 4-topic Borrow: %s "
+                    "(block=%s, tx=%s)",
+                    exc,
+                    raw_log.get("blockNumber"),
+                    _tx_hash_from_log(raw_log),
+                )
+                return None
+
+            if int(interest_rate_mode) not in (1, 2, 3):
+                log.warning(
+                    "Skipping 4-topic Borrow with unexpected "
+                    "interestRateMode=%s "
+                    "(block=%s, tx=%s)",
+                    interest_rate_mode,
+                    raw_log.get("blockNumber"),
+                    _tx_hash_from_log(raw_log),
+                )
+                return None
+
+            return {
+                "reserve": _decode_address_topic(topics[1]),
+                "user": _decode_address_topic(topics[2]),
+                "onBehalfOf": _decode_address_topic(topics[3]),
+                "amount": int(amount),
+                "interestRateMode": int(interest_rate_mode),
+                "borrowRate": int(borrow_rate),
+                # Referral code was not emitted by this variant.
+                "referralCode": 0,
+            }
+
+        # --------------------------------------------------------------
+        # Variant B:
+        #
+        # amount
+        # interestRateMode
+        # borrowRate
+        # referralCode
+        #
+        # 4 ABI words = 128 bytes
+        # --------------------------------------------------------------
+
+        if data_length == 32 * 4:
+            try:
+                (
+                    amount,
+                    interest_rate_mode,
+                    borrow_rate,
+                    referral_code,
+                ) = abi_decode(
+                    [
+                        "uint256",
+                        "uint8",
+                        "uint256",
+                        "uint16",
+                    ],
+                    data,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Skipping undecodable 4-topic Borrow with "
+                    "non-indexed referralCode: %s "
+                    "(block=%s, tx=%s)",
+                    exc,
+                    raw_log.get("blockNumber"),
+                    _tx_hash_from_log(raw_log),
+                )
+                return None
+
+            if int(interest_rate_mode) not in (1, 2, 3):
+                log.warning(
+                    "Skipping 4-topic Borrow with unexpected "
+                    "interestRateMode=%s "
+                    "(block=%s, tx=%s)",
+                    interest_rate_mode,
+                    raw_log.get("blockNumber"),
+                    _tx_hash_from_log(raw_log),
+                )
+                return None
+
+            return {
+                "reserve": _decode_address_topic(topics[1]),
+                "user": _decode_address_topic(topics[2]),
+                "onBehalfOf": _decode_address_topic(topics[3]),
+                "amount": int(amount),
+                "interestRateMode": int(interest_rate_mode),
+                "borrowRate": int(borrow_rate),
+                "referralCode": int(referral_code),
+            }
+
+        # --------------------------------------------------------------
+        # Neither supported four-topic layout matched.
+        # --------------------------------------------------------------
+
+        log.warning(
+            "Skipping 4-topic Borrow with unexpected data length: "
+            "expected 96 or 128 bytes, got %d "
+            "(block=%s, tx=%s)",
+            data_length,
+            raw_log.get("blockNumber"),
+            _tx_hash_from_log(raw_log),
+        )
+
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Log decoding
+# ---------------------------------------------------------------------------
 
 
 def decode_activity_log(pool, raw_log):
@@ -457,7 +757,11 @@ def decode_activity_log(pool, raw_log):
 
     Standard Aave events are decoded using the Pool ABI.
 
-    Borrow additionally supports the 4-topic layout observed on Monad.
+    Borrow is decoded separately because deployments can emit Borrow
+    with different topic/data layouts while retaining the same topic0.
+
+    Unknown or malformed logs return None rather than propagating
+    decoding exceptions.
     """
 
     topics = raw_log.get("topics", [])
@@ -480,39 +784,14 @@ def decode_activity_log(pool, raw_log):
         return None
 
     # ------------------------------------------------------------------
-    # Expected topic counts.
-    #
-    # Standard Aave:
-    #
-    # Supply            4
-    # Withdraw          4
-    # Borrow            5
-    # Repay             4
-    # LiquidationCall   4
-    #
-    # Monad Borrow:
-    #
-    # Borrow            4
+    # Borrow
     # ------------------------------------------------------------------
 
-    expected_topics = {
-        "Supply": 4,
-        "Withdraw": 4,
-        "Borrow": 5,
-        "Repay": 4,
-        "LiquidationCall": 4,
-    }
+    if event_name == "Borrow":
+        args = _decode_borrow_log(raw_log)
 
-    actual = len(topics)
-
-    # ------------------------------------------------------------------
-    # Monad Borrow variant
-    # ------------------------------------------------------------------
-
-    if event_name == "Borrow" and actual == 4:
-        args = _decode_monad_borrow_log(
-            raw_log
-        )
+        if args is None:
+            return None
 
         return {
             "event_type": "Borrow",
@@ -529,7 +808,15 @@ def decode_activity_log(pool, raw_log):
     # Standard event validation
     # ------------------------------------------------------------------
 
+    expected_topics = {
+        "Supply": 4,
+        "Withdraw": 4,
+        "Repay": 4,
+        "LiquidationCall": 4,
+    }
+
     expected = expected_topics[event_name]
+    actual = len(topics)
 
     if actual != expected:
         log.warning(
@@ -542,21 +829,32 @@ def decode_activity_log(pool, raw_log):
             raw_log.get("blockNumber"),
             _tx_hash_from_log(raw_log),
         )
-
         return None
 
     # ------------------------------------------------------------------
     # Decode using the actual Pool event ABI
     # ------------------------------------------------------------------
 
-    event = getattr(
-        pool.events,
-        event_name,
-    )()
+    try:
+        event = getattr(
+            pool.events,
+            event_name,
+        )()
 
-    decoded = event.process_log(
-        raw_log
-    )
+        decoded = event.process_log(
+            raw_log
+        )
+
+    except Exception as exc:
+        log.warning(
+            "Skipping undecodable Aave %s log: %s "
+            "(block=%s, tx=%s)",
+            event_name,
+            exc,
+            raw_log.get("blockNumber"),
+            _tx_hash_from_log(raw_log),
+        )
+        return None
 
     tx_hash = decoded["transactionHash"]
 
@@ -590,9 +888,7 @@ def event_matches_asset(
     """
 
     asset_address = asset_address.lower()
-
     event_type = event["event_type"]
-
     args = event["args"]
 
     if event_type == "LiquidationCall":
@@ -640,7 +936,6 @@ def build_activity_records_for_event(
         decreases utilization
 
     LiquidationCall:
-
         If monitored reserve == collateralAsset:
 
             receiveAToken == False:
@@ -664,7 +959,6 @@ def build_activity_records_for_event(
     """
 
     event_type = event["event_type"]
-
     args = event["args"]
 
     asset_address = asset_address.lower()
@@ -682,6 +976,7 @@ def build_activity_records_for_event(
     # ------------------------------------------------------------------
 
     if event_type == "Supply":
+
         amount_raw = int(args["amount"])
 
         amount = fmt_amount(
@@ -722,6 +1017,7 @@ def build_activity_records_for_event(
     # ------------------------------------------------------------------
 
     elif event_type == "Withdraw":
+
         amount_raw = int(args["amount"])
 
         amount = fmt_amount(
@@ -762,6 +1058,7 @@ def build_activity_records_for_event(
     # ------------------------------------------------------------------
 
     elif event_type == "Borrow":
+
         amount_raw = int(args["amount"])
 
         amount = fmt_amount(
@@ -788,6 +1085,7 @@ def build_activity_records_for_event(
     # ------------------------------------------------------------------
 
     elif event_type == "Repay":
+
         amount_raw = int(args["amount"])
 
         amount = fmt_amount(
@@ -814,6 +1112,7 @@ def build_activity_records_for_event(
     # ------------------------------------------------------------------
 
     elif event_type == "LiquidationCall":
+
         collateral_asset = (
             args["collateralAsset"].lower()
         )
@@ -839,12 +1138,14 @@ def build_activity_records_for_event(
         # --------------------------------------------------------------
 
         if collateral_asset == asset_address:
+
             collateral_amount = fmt_amount(
                 collateral_amount_raw,
                 decimals,
             )
 
             if receive_a_token:
+
                 records.append(
                     {
                         **base,
@@ -866,6 +1167,7 @@ def build_activity_records_for_event(
                 )
 
             else:
+
                 records.append(
                     {
                         **base,
@@ -905,6 +1207,7 @@ def build_activity_records_for_event(
         # --------------------------------------------------------------
 
         if debt_asset == asset_address:
+
             debt_amount = fmt_amount(
                 debt_to_cover_raw,
                 decimals,
@@ -956,6 +1259,7 @@ def get_relevant_activity_records(
         return []
 
     try:
+
         raw_logs = get_activity_logs(
             w3,
             pool,
@@ -964,13 +1268,15 @@ def get_relevant_activity_records(
             max_block_range=max_block_range,
         )
 
-    except Exception:
-        log.exception(
+    except Exception as exc:
+
+        log.error(
             "Failed to fetch Aave activity logs for %s, "
-            "blocks %d-%d",
+            "blocks %d-%d: %s",
             asset_address,
             from_block,
             to_block,
+            exc,
         )
 
         return []
@@ -978,7 +1284,9 @@ def get_relevant_activity_records(
     records = []
 
     for raw_log in raw_logs:
+
         try:
+
             event = decode_activity_log(
                 pool,
                 raw_log,
@@ -1001,9 +1309,14 @@ def get_relevant_activity_records(
                 )
             )
 
-        except Exception:
-            log.exception(
-                "Could not decode Aave activity log."
+        except Exception as exc:
+
+            log.warning(
+                "Could not process Aave activity log "
+                "(block=%s, tx=%s): %s",
+                raw_log.get("blockNumber"),
+                _tx_hash_from_log(raw_log),
+                exc,
             )
 
     return records
